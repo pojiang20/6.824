@@ -464,6 +464,7 @@ func TestRejoin2B(t *testing.T) {
 	// leader network failure
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect(leader1)
+	t.Log("disconnect ", leader1)
 
 	// make old leader try to agree on some entries
 	cfg.rafts[leader1].Start(102)
@@ -476,14 +477,17 @@ func TestRejoin2B(t *testing.T) {
 	// new leader network failure
 	leader2 := cfg.checkOneLeader()
 	cfg.disconnect(leader2)
+	t.Log("disconnect ", leader2)
 
 	// old leader connected again
 	cfg.connect(leader1)
+	t.Log("connect ", leader1)
 
 	cfg.one(104, 2, true)
 
 	// all together now
 	cfg.connect(leader2)
+	t.Log("connect ", leader2)
 
 	cfg.one(105, servers, true)
 
@@ -502,8 +506,11 @@ func TestBackup2B(t *testing.T) {
 	// put leader and one follower in a partition
 	leader1 := cfg.checkOneLeader()
 	cfg.disconnect((leader1 + 2) % servers)
+	t.Log((leader1 + 2) % servers)
 	cfg.disconnect((leader1 + 3) % servers)
+	t.Log((leader1 + 3) % servers)
 	cfg.disconnect((leader1 + 4) % servers)
+	t.Log((leader1 + 4) % servers)
 
 	// submit lots of commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -513,12 +520,17 @@ func TestBackup2B(t *testing.T) {
 	time.Sleep(RaftElectionTimeout / 2)
 
 	cfg.disconnect((leader1 + 0) % servers)
+	t.Log((leader1 + 0) % servers)
 	cfg.disconnect((leader1 + 1) % servers)
+	t.Log((leader1 + 1) % servers)
 
 	// allow other partition to recover
 	cfg.connect((leader1 + 2) % servers)
+	t.Log("connect", (leader1+2)%servers)
 	cfg.connect((leader1 + 3) % servers)
+	t.Log("connect", (leader1+3)%servers)
 	cfg.connect((leader1 + 4) % servers)
+	t.Log("connect", (leader1+4)%servers)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
@@ -532,6 +544,7 @@ func TestBackup2B(t *testing.T) {
 		other = (leader2 + 1) % servers
 	}
 	cfg.disconnect(other)
+	t.Log(other)
 
 	// lots more commands that won't commit
 	for i := 0; i < 50; i++ {
@@ -545,8 +558,11 @@ func TestBackup2B(t *testing.T) {
 		cfg.disconnect(i)
 	}
 	cfg.connect((leader1 + 0) % servers)
+	t.Log("connect", (leader1+0)%servers)
 	cfg.connect((leader1 + 1) % servers)
+	t.Log("connect", (leader1+1)%servers)
 	cfg.connect(other)
+	t.Log("connect", other)
 
 	// lots of successful commands to new group.
 	for i := 0; i < 50; i++ {
