@@ -543,9 +543,12 @@ func (rf *Raft) checkCommitIndexMajority() {
 	if rf.State != Leader {
 		return
 	}
-	tryCommitIndex := rf.commitIndex + 1
 	DPrintf("[%d],role=%d term=%d\t match[%v]", rf.me, rf.State, rf.CurrentTerm, rf.matchIndex)
-	for tryCommitIndex < len(rf.log) {
+	for tryCommitIndex := rf.commitIndex + 1; tryCommitIndex < len(rf.log); tryCommitIndex++ {
+		//解决Figure8问题
+		if rf.log[tryCommitIndex].Term != rf.CurrentTerm {
+			continue
+		}
 		cnt := 0
 		for peer := range rf.peers {
 			if rf.matchIndex[peer] >= tryCommitIndex {
@@ -553,16 +556,14 @@ func (rf *Raft) checkCommitIndexMajority() {
 			}
 		}
 		if cnt > len(rf.peers)/2 {
-			tryCommitIndex++
-			if tryCommitIndex-1 > rf.commitIndex {
-				rf.commitIndex = tryCommitIndex - 1
-				DPrintf("[%d],role=%d term=%d\t commitIndex=%d", rf.me, rf.State, rf.CurrentTerm, rf.commitIndex)
+			for nextCommitIndex := rf.commitIndex + 1; nextCommitIndex <= tryCommitIndex; nextCommitIndex++ {
 				rf.applyCh <- ApplyMsg{
 					CommandValid: true,
-					Command:      rf.log[rf.commitIndex].Cmd,
-					CommandIndex: rf.commitIndex,
+					Command:      rf.log[nextCommitIndex].Cmd,
+					CommandIndex: nextCommitIndex,
 				}
 			}
+			rf.commitIndex = tryCommitIndex
 		} else {
 			break
 		}
