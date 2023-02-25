@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"6.5840/labgob"
+	"bytes"
 	//	"bytes"
 	"math/rand"
 	"sync"
@@ -71,9 +73,9 @@ type Raft struct {
 
 	//状态
 	State raftState
-	//当前任期
+	//当前任期【持久化】
 	CurrentTerm int
-	//把票投给了谁，要么是投给了谁的candidateID要么是空
+	//把票投给了谁，要么是投给了谁的candidateID要么是空【持久化】
 	VotedFor int
 	//获得选票
 	voteNum int
@@ -81,7 +83,7 @@ type Raft struct {
 	latestElectionTime time.Time
 	//心跳间隙
 	heartBeatIntervalMS time.Duration
-	//日志,序列从1开始
+	//日志,序列从1开始【持久化】
 	log         []RaftLog
 	commitIndex int
 	lastApplied int
@@ -126,6 +128,14 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.CurrentTerm)
+	e.Encode(rf.VotedFor)
+	e.Encode(rf.log)
+	raftstate := w.Bytes()
+	rf.persister.Save(raftstate, nil)
+	DPrintf("[%d],role=%d term=%d\t persist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
 }
 
 // restore previously persisted state.
@@ -146,6 +156,20 @@ func (rf *Raft) readPersist(data []byte) {
 	//   rf.xxx = xxx
 	//   rf.yyy = yyy
 	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var curTerm int
+	var votedFor int
+	var log []RaftLog
+	if d.Decode(&curTerm) != nil || d.Decode(&votedFor) != nil || d.Decode(&log) != nil {
+		DPrintf("readPersist error")
+		return
+	} else {
+		rf.VotedFor = votedFor
+		rf.CurrentTerm = curTerm
+		rf.log = log
+		DPrintf("[%d],role=%d term=%d\t readPersist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+	}
 }
 
 // the service says it has created a snapshot that has
@@ -198,6 +222,10 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.CurrentTerm = args.Term
 		rf.State = Follower
 		rf.VotedFor = -1
+		rf.persist()
+	}
+	if rf.State != Follower {
+		return
 	}
 	rf.latestElectionTime = time.Now()
 	if (rf.VotedFor == -1 || rf.VotedFor == args.CandidateId) && rf.isUpToDate(args.LastLogIndex, args.LastLogTerm) {
@@ -205,6 +233,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		reply.Term = rf.CurrentTerm
 		reply.VoteGranted = true
 		rf.VotedFor = args.CandidateId
+		rf.persist()
 		DPrintf("[%d],role=%d term=%d\t vote to %d", rf.me, rf.State, rf.CurrentTerm, rf.VotedFor)
 	}
 	return
@@ -275,6 +304,11 @@ type AppendEntriesArgs struct {
 type AppendEntriesReply struct {
 	Term    int
 	Success bool
+
+	//优化
+	Xterm  int //term in the conflicting entry (if any)
+	XIndex int //index of first entry with that term (if any)
+	XLen   int //log length
 }
 
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -289,9 +323,31 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	//Reply false if log doesn’t contain an entry at prevLogIndex
 	//whose term matches prevLogTerm
-	if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	//if args.PrevLogIndex > len(rf.log)-1 || rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+	//	reply.Success = false
+	//	reply.Term = rf.CurrentTerm
+	//	return
+	//}
+	if args.PrevLogIndex > len(rf.log)-1 {
 		reply.Success = false
 		reply.Term = rf.CurrentTerm
+		reply.XIndex = -1
+		reply.Xterm = -1
+		reply.XLen = len(rf.log)
+		return
+	}
+	if rf.log[args.PrevLogIndex].Term != args.PrevLogTerm {
+		reply.Success = false
+		reply.Term = rf.CurrentTerm
+		//找到任期内的起始坐标
+		curTerm, i := rf.log[args.PrevLogIndex].Term, args.PrevLogIndex
+		//log从1开始
+		for i > 1 && curTerm == rf.log[i-1].Term {
+			i--
+		}
+		reply.XLen = len(rf.log)
+		reply.XIndex = i
+		reply.Xterm = curTerm
 		return
 	}
 	//rf.latestElectionTime = time.Now()
@@ -307,6 +363,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if len(args.Entries) > 0 {
 		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
 	}
+	rf.persist()
 	//更新commit
 	if rf.commitIndex < args.LeaderCommit {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
@@ -361,6 +418,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		term = rf.CurrentTerm
 		index = len(rf.log)
 		rf.log = append(rf.log, RaftLog{Term: term, Cmd: command})
+		rf.persist()
 		//then issues AppendEntries RPCs in parallel to each of the other servers to replicate the entry.
 		go rf.replicateEntry()
 	}
@@ -392,6 +450,9 @@ func (rf *Raft) sendAppendEntries(isHeartBeat bool, peerId int) {
 		return
 	}
 	prevLogIndex := rf.nextIndex[peerId] - 1
+	if prevLogIndex < 0 {
+		prevLogIndex = 0
+	}
 	args := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderId:     rf.me,
@@ -422,20 +483,58 @@ func (rf *Raft) sendAppendEntries(isHeartBeat bool, peerId int) {
 		rf.State = Follower
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
+		rf.persist()
 		return
 	}
 	if reply.Success {
 		leaderLastLogIndex := args.PrevLogIndex + len(args.Entries)
 		//update nextIndex and matchIndex for follower
 		rf.nextIndex[peerId] = leaderLastLogIndex + 1
-		//TODO 存疑
 		rf.matchIndex[peerId] = leaderLastLogIndex
 		go rf.checkCommitIndexMajority()
 	} else if rf.nextIndex[peerId] > 1 {
-		rf.nextIndex[peerId]--
+		//rf.nextIndex[peerId]--
+		//优化回退策略
+		//Case 1: leader doesn't have XTerm:
+		//nextIndex = XIndex
+		//Case 2: leader has XTerm:
+		//nextIndex = leader's last entry for XTerm
+		//Case 3: follower's log is too short:
+		//nextIndex = XLen
+		if reply.XIndex == -1 && reply.Xterm == -1 {
+			rf.nextIndex[peerId] = reply.XLen
+		} else {
+			//判断是否存在Xterm
+			if exist, idx := findXTerm(rf.log, reply.Xterm); exist {
+				rf.nextIndex[peerId] = idx
+			} else {
+				//不存在表示这个任期内所有操作都将被覆盖
+				rf.nextIndex[peerId] = reply.XIndex
+			}
+		}
 		go rf.sendAppendEntries(false, peerId)
 	}
 	return
+}
+
+// 找到大于等于Xterm的最后一个坐标
+func findXTerm(log []RaftLog, Xterm int) (bool, int) {
+	l, r, target := 1, len(log)-1, Xterm+1
+	for l < r {
+		mid := (l + r) / 2
+		if log[mid].Term >= target {
+			r = mid
+		} else {
+			l = mid + 1
+		}
+	}
+	if log[l].Term == Xterm {
+		return true, l
+	} else if l == 1 {
+		return false, l
+	} else {
+		return false, l - 1
+	}
 }
 
 func (rf *Raft) checkCommitIndexMajority() {
@@ -521,6 +620,7 @@ func (rf *Raft) StartElection() {
 	rf.State = Candidate
 	rf.VotedFor = rf.me
 	rf.latestElectionTime = time.Now()
+	rf.persist()
 	DPrintf("[%d],role=%d term=%d\t start election", rf.me, rf.State, rf.CurrentTerm)
 	//给所有其他节点发起请求
 	for i := range rf.peers {
@@ -552,6 +652,7 @@ func (rf *Raft) _sendRequest(newTerm int, peerId int) {
 		rf.State = Follower
 		rf.CurrentTerm = reply.Term
 		rf.VotedFor = -1
+		rf.persist()
 		return
 	}
 	//角色变化
@@ -569,6 +670,8 @@ func (rf *Raft) _sendRequest(newTerm int, peerId int) {
 		DPrintf("[%d],role=%d term=%d\t become leader\t log len %d", rf.me, rf.State, rf.CurrentTerm, len(rf.log))
 		rf.State = Leader
 		rf.VotedFor = -1
+		//TODO 是否需要持久化？
+		rf.persist()
 		rf.reInitNextAndMatchIndex(len(rf.log) - 1)
 		go rf.sendHeartBeat()
 	}
