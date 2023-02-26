@@ -360,8 +360,19 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	reply.Success = true
 	reply.Term = rf.CurrentTerm
 	//追加内容
-	if len(args.Entries) > 0 {
-		rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	DPrintf("[%d],role=%d term=%d\t before append entries %v,preLogIndex:%d,args entries: %v,from %d", rf.me, rf.State, rf.CurrentTerm, rf.log, args.PrevLogIndex, args.Entries, args.LeaderId)
+	//if len(args.Entries) > 0 {
+	//	rf.log = append(rf.log[:args.PrevLogIndex+1], args.Entries...)
+	//}
+	for i, entry := range args.Entries {
+		idx := args.PrevLogIndex + i + 1
+		if idx < len(rf.log) && entry.Term != rf.log[idx].Term {
+			rf.log = append(rf.log[:idx], args.Entries[i:]...)
+		}
+		if idx >= len(rf.log) {
+			rf.log = append(rf.log, args.Entries[i:]...)
+			break
+		}
 	}
 	rf.persist()
 	//更新commit
@@ -449,26 +460,28 @@ func (rf *Raft) sendAppendEntries(isHeartBeat bool, peerId int) {
 		rf.mu.Unlock()
 		return
 	}
-	prevLogIndex := rf.nextIndex[peerId] - 1
-	if prevLogIndex < 0 {
-		prevLogIndex = 0
+	nextIndex := rf.nextIndex[peerId]
+	if nextIndex <= 0 {
+		nextIndex = 1
 	}
+	if nextIndex > len(rf.log) {
+		nextIndex = len(rf.log)
+	}
+	prevLogIndex := nextIndex - 1
 	args := AppendEntriesArgs{
 		Term:         rf.CurrentTerm,
 		LeaderId:     rf.me,
 		PrevLogIndex: prevLogIndex,
 		PrevLogTerm:  rf.log[prevLogIndex].Term,
 		LeaderCommit: rf.commitIndex,
-		Entries:      rf.log[prevLogIndex+1:],
+		Entries:      make([]RaftLog, len(rf.log)-nextIndex),
 	}
-	if !isHeartBeat {
-		args.Entries = rf.log[prevLogIndex+1:]
-	}
+	copy(args.Entries, rf.log[nextIndex:])
 	reply := AppendEntriesReply{}
 	if isHeartBeat {
-		DPrintf("[%d],role=%d term=%d\t send heart beat to %d\t prevlogIndex:%d,prevlogTerm:%d", rf.me, rf.State, rf.CurrentTerm, peerId, args.PrevLogIndex, args.PrevLogTerm)
+		DPrintf("[%d],role=%d term=%d\t send heart beat to %d\t prevlogIndex:%d,prevlogTerm:%d,entries:%v", rf.me, rf.State, rf.CurrentTerm, peerId, args.PrevLogIndex, args.PrevLogTerm, args.Entries)
 	} else {
-		DPrintf("[%d],role=%d term=%d\t send append entries to %d\t prevlogIndex:%d,prevlogTerm:%d,commitIndex:%d", rf.me, rf.State, rf.CurrentTerm, peerId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit)
+		DPrintf("[%d],role=%d term=%d\t send append entries to %d\t prevlogIndex:%d,prevlogTerm:%d,commitIndex:%d,entries:%v", rf.me, rf.State, rf.CurrentTerm, peerId, args.PrevLogIndex, args.PrevLogTerm, args.LeaderCommit, args.Entries)
 	}
 	rf.mu.Unlock()
 
@@ -563,6 +576,7 @@ func (rf *Raft) checkCommitIndexMajority() {
 					CommandIndex: nextCommitIndex,
 				}
 			}
+			DPrintf("[%d],role=%d term=%d\t commitIndex=%d tryCommitIndex=%d", rf.me, rf.State, rf.CurrentTerm, rf.commitIndex, tryCommitIndex)
 			rf.commitIndex = tryCommitIndex
 		} else {
 			break
@@ -671,7 +685,6 @@ func (rf *Raft) _sendRequest(newTerm int, peerId int) {
 		DPrintf("[%d],role=%d term=%d\t become leader\t log len %d", rf.me, rf.State, rf.CurrentTerm, len(rf.log))
 		rf.State = Leader
 		rf.VotedFor = -1
-		//TODO 是否需要持久化？
 		rf.persist()
 		rf.reInitNextAndMatchIndex(len(rf.log) - 1)
 		go rf.sendHeartBeat()
