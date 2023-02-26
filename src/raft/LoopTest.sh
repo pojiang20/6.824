@@ -1,5 +1,5 @@
-TestType=4
-TestRound=100
+TestType=6
+TestRound=10
 #1 background 2A
 if [ $TestType = 1 ]
 then
@@ -67,6 +67,26 @@ then
         ((Cnt=Cnt+1))
       else
         mv log "2Cerr_${Cnt}"
+      fi
+    done
+    echo "Passing rate: $Cnt/$TestRound"
+    echo "Finish $(date +%Y-%m-%d" "%H:%M:%S)"
+fi
+
+#7 TestFunc
+testFunc="TestUnreliableChurn2C"
+echo "${testFunc} start $(date +%Y-%m-%d" "%H:%M:%S)"
+if [ $TestType = 7 ]
+then
+  Cnt=0
+  for i in $(seq 1 $TestRound)
+    do
+      go test -v -run ${testFunc} > log
+      res=$(cat log | grep Passed | wc -l)
+      if ((res==1));then
+        ((Cnt=Cnt+1))
+      else
+        mv log "2Cerr_${testFunc}_${Cnt}"
       fi
     done
     echo "Passing rate: $Cnt/$TestRound"
