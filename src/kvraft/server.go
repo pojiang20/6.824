@@ -7,9 +7,10 @@ import (
 	"log"
 	"sync"
 	"sync/atomic"
+	"time"
 )
 
-const Debug = false
+const Debug = true
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if Debug {
@@ -18,11 +19,20 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	return
 }
 
+const (
+	GET    = "GET"
+	PUT    = "PUT"
+	APPEND = "APPEND"
+)
 
 type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	OpType string
+	Key    string
+	Val    string
+	ReqId  int
 }
 
 type KVServer struct {
@@ -35,15 +45,110 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	//内存存储数据
+	data map[string]string
+	//返回值
+	RetMsgMap map[int]chan RetMsg
 }
 
+type RetMsg struct {
+	val string
+	err Err
+}
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrNotLeader
+		return
+	}
 	// Your code here.
+	op := Op{
+		OpType: GET,
+		Key:    args.Key,
+		ReqId:  args.ReqId,
+	}
+	retCh := make(chan RetMsg)
+	kv.RetMsgMap[args.ReqId] = retCh
+	ret, err := kv.CmdRun(op, retCh)
+	reply.Err = err
+	reply.Value = ret
+}
+
+func (kv *KVServer) CmdRun(op Op, ch chan RetMsg) (ret string, err Err) {
+	kv.rf.Start(op)
+	select {
+	case retMgs := <-ch:
+		return retMgs.val, retMgs.err
+	case <-time.After(5 * time.Minute):
+		return "", ErrTimeout
+	}
+}
+
+func (kv *KVServer) Applier() {
+	for !kv.killed() {
+		select {
+		case msg := <-kv.applyCh:
+			if msg.CommandValid {
+				kv.mu.Lock()
+				op := msg.Command.(Op)
+				DPrintf("Applier get op: %+v", op)
+				if retMsgCh, ok := kv.RetMsgMap[op.ReqId]; ok {
+					retMsgCh <- kv.applyToStateMachine(op)
+				}
+				kv.mu.Unlock()
+			}
+		}
+	}
+}
+
+func (kv *KVServer) applyToStateMachine(op Op) (ret RetMsg) {
+	switch op.OpType {
+	case GET:
+		key := op.Key
+		if val, ok := kv.data[key]; ok {
+			ret = RetMsg{val: val, err: NoError}
+		} else {
+			ret = RetMsg{val: "", err: ErrKeyNotExist}
+		}
+	case PUT:
+		k, v := op.Key, op.Val
+		kv.data[k] = v
+		ret = RetMsg{err: NoError}
+	case APPEND:
+		key, v := op.Key, op.Val
+		if val, ok := kv.data[key]; ok {
+			kv.data[key] = val + v
+			ret = RetMsg{err: NoError}
+		} else {
+			ret = RetMsg{err: ErrKeyNotExist}
+		}
+	default:
+		//不支持
+		ret = RetMsg{err: ErrNotSupport}
+	}
+	return
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	// Your code here.
+	_, isLeader := kv.rf.GetState()
+	if !isLeader {
+		reply.Err = ErrNotLeader
+		return
+	}
+	// Your code here.
+	op := Op{
+		OpType: args.Op,
+		Key:    args.Key,
+		Val:    args.Value,
+		ReqId:  args.ReqId,
+	}
+	retCh := make(chan RetMsg, 1)
+	kv.RetMsgMap[args.ReqId] = retCh
+	_, err := kv.CmdRun(op, retCh)
+	reply.Err = err
+	return
 }
 
 // the tester calls Kill() when a KVServer instance won't
@@ -92,6 +197,10 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
+	kv.data = make(map[string]string)
+	kv.RetMsgMap = make(map[int]chan RetMsg)
+
+	go kv.Applier()
 
 	return kv
 }

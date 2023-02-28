@@ -8,6 +8,14 @@ const (
 
 type Err string
 
+const (
+	NoError        = Err("Ok")
+	ErrNotLeader   = Err("Not Leader")
+	ErrTimeout     = Err("time out")
+	ErrKeyNotExist = Err("key not exist")
+	ErrNotSupport  = Err("Not support this method")
+)
+
 // Put or Append
 type PutAppendArgs struct {
 	Key   string
@@ -16,6 +24,7 @@ type PutAppendArgs struct {
 	// You'll have to add definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
+	ReqId int
 }
 
 type PutAppendReply struct {
@@ -25,6 +34,7 @@ type PutAppendReply struct {
 type GetArgs struct {
 	Key string
 	// You'll have to add definitions here.
+	ReqId int
 }
 
 type GetReply struct {
