@@ -2,6 +2,8 @@ package kvraft
 
 import (
 	"6.5840/labrpc"
+	"sync/atomic"
+	"time"
 )
 import "crypto/rand"
 import "math/big"
@@ -9,10 +11,9 @@ import "math/big"
 type Clerk struct {
 	servers []*labrpc.ClientEnd
 	// You will have to modify this struct.
-	clientId int
-	leaderId int
-
-	debugMode bool
+	clientId  int64
+	leaderId  int64
+	requestId int64
 }
 
 func nrand() int64 {
@@ -26,16 +27,13 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 	// You'll have to add code here.
-	ck.debugMode = true
+	ck.clientId = nrand()
+	ck.requestId = 0
+	ck.leaderId = 0
 	return ck
 }
 
-var ReqId = 0
-
-func GenReqId() int {
-	ReqId++
-	return ReqId
-}
+const breakTimeMs = time.Duration(20 * time.Millisecond)
 
 // fetch the current value for a key.
 // returns "" if the key does not exist.
@@ -48,42 +46,37 @@ func GenReqId() int {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) string {
-	DPrintf("Get key=%s", key)
-
+	DPrintf("clientId[%d]\t Get key=%s", ck.clientId, key)
+	requestId := atomic.AddInt64(&ck.requestId, 1)
 	// You will have to modify this function.
 	args := &GetArgs{
-		Key:   key,
-		ReqId: GenReqId(),
+		Key:       key,
+		RequestId: int(requestId),
+		ClientId:  int(ck.clientId),
 	}
 	reply := &GetReply{}
-	leaderId := ck.leaderId
+
+	leaderId := atomic.LoadInt64(&ck.leaderId)
+	value := ""
 	for {
 		ok := ck._sendGet(leaderId, args, reply)
-		if !ok {
-			DPrintf("Get rpc not ok")
-			continue
+		DPrintf("clientId[%d]\t Get reply=%s", ck.clientId, reply.Err)
+		if ok && reply.Err != ErrNotLeader {
+			if reply.Err == NoError {
+				value = reply.Value
+			}
+			break
 		}
-		DPrintf("Get return %s", reply.Err)
-		switch reply.Err {
-		case NoError:
-			ck.leaderId = leaderId
-			return reply.Value
-		case ErrKeyNotExist:
-			ck.leaderId = leaderId
-			return ""
-		case ErrTimeout:
-			continue
-		case ErrNotLeader:
-			fallthrough
-		default:
-			DPrintf("leaderId[%d] increase", leaderId)
-			leaderId = (leaderId + 1) % len(ck.servers)
-		}
+		DPrintf("clientId[%d]\t leaderid=%d change", ck.clientId, leaderId)
+		leaderId = (leaderId + 1) % int64(len(ck.servers))
+		time.Sleep(breakTimeMs)
 	}
-	return ""
+	ck.leaderId = leaderId
+	DPrintf("clientId[%d]\t get from leader=%d return %s", ck.clientId, leaderId, value)
+	return value
 }
 
-func (ck *Clerk) _sendGet(peerId int, args *GetArgs, reply *GetReply) bool {
+func (ck *Clerk) _sendGet(peerId int64, args *GetArgs, reply *GetReply) bool {
 	return ck.servers[peerId].Call("KVServer.Get", args, reply)
 }
 
@@ -96,44 +89,35 @@ func (ck *Clerk) _sendGet(peerId int, args *GetArgs, reply *GetReply) bool {
 // must match the declared types of the RPC handler function's
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
-	DPrintf("PutAppend key=%s,value=%s,op=%s", key, value, op)
+	DPrintf("clientId[%d]\t 【PutAppend】 key=%s,value=%s,op=%s", ck.clientId, key, value, op)
 	// You will have to modify this function.
+	requestId := atomic.AddInt64(&ck.requestId, 1)
+	leaderId := atomic.LoadInt64(&ck.leaderId)
 	args := &PutAppendArgs{
-		Key:   key,
-		Op:    op,
-		Value: value,
-		ReqId: GenReqId(),
+		Key:       key,
+		Op:        op,
+		Value:     value,
+		RequestId: int(requestId),
+		ClientId:  int(ck.clientId),
 	}
 	reply := &PutAppendReply{}
-	leaderId := ck.leaderId
 	for {
 		ok := ck._sendPutAppend(leaderId, args, reply)
-		if !ok {
-			DPrintf("PutAppend rpc not ok")
+		DPrintf("clientId[%d]\t PutAppend reply=%s", ck.clientId, reply.Err)
+		if ok && reply.Err == ErrNotLeader {
+			DPrintf("clientId[%d]\t leaderid=%d change", ck.clientId, leaderId)
+			leaderId = (leaderId + 1) % int64(len(ck.servers))
+			time.Sleep(breakTimeMs)
 			continue
 		}
-		DPrintf("PutAppend RPC return %s", reply.Err)
-		switch reply.Err {
-		case NoError:
-			ck.leaderId = leaderId
-			return
-		case ErrKeyNotExist:
-			ck.leaderId = leaderId
-			DPrintf("set wrong key")
-			return
-		case ErrTimeout:
-			continue
-		case ErrNotLeader:
-			fallthrough
-		default:
-			DPrintf("leaderId[%d] increase", leaderId)
-			leaderId = (leaderId + 1) % len(ck.servers)
-		}
+		break
 	}
+	ck.leaderId = leaderId
+	DPrintf("clientId[%d]\t PutAppend to leader=%d", ck.clientId, leaderId)
 	return
 }
 
-func (ck *Clerk) _sendPutAppend(peerId int, args *PutAppendArgs, reply *PutAppendReply) bool {
+func (ck *Clerk) _sendPutAppend(peerId int64, args *PutAppendArgs, reply *PutAppendReply) bool {
 	return ck.servers[peerId].Call("KVServer.PutAppend", args, reply)
 }
 

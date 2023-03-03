@@ -29,10 +29,12 @@ type Op struct {
 	// Your definitions here.
 	// Field names must start with capital letters,
 	// otherwise RPC will break.
-	OpType string
-	Key    string
-	Val    string
-	ReqId  int
+	OpType    string
+	Key       string
+	Val       string
+	RequestId int //用于RetMsgMap中op和retCh的映射
+	ClientId  int //表示客户端身份
+	MsgId     int //与日志中该op的位置对应
 }
 
 type KVServer struct {
@@ -49,6 +51,8 @@ type KVServer struct {
 	data map[string]string
 	//返回值
 	RetMsgMap map[int]chan RetMsg
+	//记录每一个客户端最后一个被应用的ID
+	lastApplied map[int]int
 }
 
 type RetMsg struct {
@@ -57,46 +61,93 @@ type RetMsg struct {
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
+	DPrintf("KVServer.Get, requestId=%d clientId=%d", args.RequestId, args.ClientId)
+	if _, isLeader := kv.rf.GetState(); !isLeader {
 		reply.Err = ErrNotLeader
 		return
 	}
 	// Your code here.
 	op := Op{
-		OpType: GET,
-		Key:    args.Key,
-		ReqId:  args.ReqId,
+		OpType:    GET,
+		Key:       args.Key,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
 	}
-	retCh := make(chan RetMsg)
-	kv.RetMsgMap[args.ReqId] = retCh
-	ret, err := kv.CmdRun(op, retCh)
-	reply.Err = err
-	reply.Value = ret
+	reply.Value, reply.Err = kv.OpRun(op, args.RequestId)
+	DPrintf("KVServer.Get\t reply:[+%v]", reply)
 }
 
-func (kv *KVServer) CmdRun(op Op, ch chan RetMsg) (ret string, err Err) {
-	kv.rf.Start(op)
+func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
+	DPrintf("Call.PutAppend, requestId=%d clientId=%d op=%s", args.RequestId, args.ClientId, args.Op)
+	if _, isLeader := kv.rf.GetState(); !isLeader {
+		reply.Err = ErrNotLeader
+		return
+	}
+	// Your code here.
+	op := Op{
+		OpType:    args.Op,
+		Key:       args.Key,
+		Val:       args.Value,
+		RequestId: args.RequestId,
+		ClientId:  args.ClientId,
+	}
+	_, err := kv.OpRun(op, args.RequestId)
+	reply.Err = err
+	DPrintf("KVServer.PutAppend\t reply:%s", reply.Err)
+}
+
+func (kv *KVServer) OpRun(op Op, RequestId int) (ret string, err Err) {
+	_, _, isLeader := kv.rf.Start(op)
+	if !isLeader {
+		return "", ErrNotLeader
+	}
+	retMsgCh := kv.getCh(RequestId)
+
 	select {
-	case retMgs := <-ch:
+	case retMgs := <-retMsgCh:
+		kv.removeCh(RequestId)
 		return retMgs.val, retMgs.err
-	case <-time.After(5 * time.Minute):
+	case <-time.After(600 * time.Millisecond):
 		return "", ErrTimeout
 	}
 }
 
+func (kv *KVServer) getCh(RequestId int) (ret chan RetMsg) {
+	kv.mu.Lock()
+	if _, ok := kv.RetMsgMap[RequestId]; !ok {
+		retMsgCh := make(chan RetMsg, 1)
+		kv.RetMsgMap[RequestId] = retMsgCh
+	}
+	ret = kv.RetMsgMap[RequestId]
+	kv.mu.Unlock()
+	return
+}
+
+func (kv *KVServer) removeCh(RequestId int) {
+	kv.mu.Lock()
+	delete(kv.RetMsgMap, RequestId)
+	kv.mu.Unlock()
+}
+
+func (kv *KVServer) isRepeated(clientId int, msgId int) bool {
+	if val, ok := kv.lastApplied[clientId]; ok {
+		return msgId == val
+	}
+	return false
+}
+
 func (kv *KVServer) Applier() {
+	DPrintf("kvId=%d, Start Applier", kv.me)
 	for !kv.killed() {
 		select {
 		case msg := <-kv.applyCh:
 			if msg.CommandValid {
-				kv.mu.Lock()
 				op := msg.Command.(Op)
-				DPrintf("Applier get op: %+v", op)
-				if retMsgCh, ok := kv.RetMsgMap[op.ReqId]; ok {
-					retMsgCh <- kv.applyToStateMachine(op)
+				DPrintf("kvId=%d,Applier get op: [%+v]", kv.me, op)
+				if retMsgCh, ok := kv.RetMsgMap[op.RequestId]; ok {
+					ret := kv.applyToStateMachine(op)
+					retMsgCh <- ret
 				}
-				kv.mu.Unlock()
 			}
 		}
 	}
@@ -127,27 +178,7 @@ func (kv *KVServer) applyToStateMachine(op Op) (ret RetMsg) {
 		//不支持
 		ret = RetMsg{err: ErrNotSupport}
 	}
-	return
-}
-
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	_, isLeader := kv.rf.GetState()
-	if !isLeader {
-		reply.Err = ErrNotLeader
-		return
-	}
-	// Your code here.
-	op := Op{
-		OpType: args.Op,
-		Key:    args.Key,
-		Val:    args.Value,
-		ReqId:  args.ReqId,
-	}
-	retCh := make(chan RetMsg, 1)
-	kv.RetMsgMap[args.ReqId] = retCh
-	_, err := kv.CmdRun(op, retCh)
-	reply.Err = err
+	DPrintf("【op】%+v【ret】%+v", op, ret)
 	return
 }
 
@@ -199,6 +230,7 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.RetMsgMap = make(map[int]chan RetMsg)
+	kv.lastApplied = make(map[int]int)
 
 	go kv.Applier()
 

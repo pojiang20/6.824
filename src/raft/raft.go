@@ -128,14 +128,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+	rf.persister.Save(rf.serializeState(), nil)
+	DPrintf("[%d],role=%d term=%d\t persist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+}
+
+func (rf *Raft) serializeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.log)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
-	DPrintf("[%d],role=%d term=%d\t persist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -416,7 +419,7 @@ func (rf *Raft) applyCommitted() {
 // term. the third return value is true if this server believes it is
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
-	//DPrintf("[%d],role=%d term=%d\t start cmd[%v]", rf.me, rf.State, rf.CurrentTerm, command)
+	DPrintf("[%d],role=%d term=%d\t start cmd[%+v]", rf.me, rf.State, rf.CurrentTerm, command)
 	index := -1
 	term := -1
 
@@ -452,6 +455,13 @@ func (rf *Raft) replicateEntry() {
 			go rf.sendAppendEntries(false, i)
 		}
 	}
+}
+
+func (rf *Raft) lastLog() (ret RaftLog) {
+	rf.mu.Lock()
+	ret = rf.log[len(rf.log)-1]
+	rf.mu.Unlock()
+	return
 }
 
 func (rf *Raft) sendAppendEntries(isHeartBeat bool, peerId int) {
@@ -682,8 +692,8 @@ func (rf *Raft) _sendRequest(newTerm int, peerId int) {
 		rf.voteNum++
 	}
 	if rf.voteNum > len(rf.peers)/2 {
-		DPrintf("[%d],role=%d term=%d\t become leader\t log len %d", rf.me, rf.State, rf.CurrentTerm, len(rf.log))
 		rf.State = Leader
+		DPrintf("[%d],role=%d term=%d\t become leader\t log len %d", rf.me, rf.State, rf.CurrentTerm, len(rf.log))
 		rf.VotedFor = -1
 		rf.persist()
 		rf.reInitNextAndMatchIndex(len(rf.log) - 1)
