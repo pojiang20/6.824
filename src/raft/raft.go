@@ -96,6 +96,11 @@ type Raft struct {
 type RaftLog struct {
 	Cmd  interface{}
 	Term int
+	//You won't be able to store the log in a Go slice
+	//and use Go slice indices interchangeably with Raft log indices;
+	//you'll need to index the slice in a way that accounts for the discarded portion of the log.
+	//由于存在快照，日志位置和切片位置不再一致，需要记录
+	Index int
 }
 
 // return currentTerm and whether this server
@@ -128,14 +133,17 @@ func (rf *Raft) persist() {
 	// e.Encode(rf.yyy)
 	// raftstate := w.Bytes()
 	// rf.persister.Save(raftstate, nil)
+
+	rf.persister.Save(rf.serializeState(), nil)
+	DPrintf("[%d],role=%d term=%d\t persist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+}
+func (rf *Raft) serializeState() []byte {
 	w := new(bytes.Buffer)
 	e := labgob.NewEncoder(w)
 	e.Encode(rf.CurrentTerm)
 	e.Encode(rf.VotedFor)
 	e.Encode(rf.log)
-	raftstate := w.Bytes()
-	rf.persister.Save(raftstate, nil)
-	DPrintf("[%d],role=%d term=%d\t persist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+	return w.Bytes()
 }
 
 // restore previously persisted state.
@@ -169,6 +177,8 @@ func (rf *Raft) readPersist(data []byte) {
 		rf.CurrentTerm = curTerm
 		rf.log = log
 		DPrintf("[%d],role=%d term=%d\t readPersist %v", rf.me, rf.State, rf.CurrentTerm, rf.log)
+		rf.commitIndex = rf.log[0].Index
+		rf.lastApplied = rf.log[0].Index
 	}
 }
 
@@ -176,9 +186,99 @@ func (rf *Raft) readPersist(data []byte) {
 // all info up to and including index. this means the
 // service no longer needs the log through (and including)
 // that index. Raft should now trim its log as much as possible.
+// index是逻辑上的，i是slice物理上的
 func (rf *Raft) Snapshot(index int, snapshot []byte) {
 	// Your code here (2D).
+	for i, x := range rf.log {
+		if x.Index == index {
+			//包含index,填充log[0]作为，index+1对应log[1]开始有效
+			rf.log = logAfterIndex(rf.log, i)
+			rf.log[0].Cmd = nil
+			rf.persister.Save(rf.serializeState(), snapshot)
+		}
+	}
+}
 
+// 重新创建切片存储,包含index
+func logAfterIndex(source []RaftLog, index int) []RaftLog {
+	return append([]RaftLog{}, source[index:]...)
+}
+
+type InstallSnapshotArgs struct {
+	Term              int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	reply.Term = rf.CurrentTerm
+	if rf.CurrentTerm > args.Term {
+		return
+	}
+	if rf.CurrentTerm < args.Term {
+		rf.State = Follower
+		rf.VotedFor = -1
+		rf.CurrentTerm = args.Term
+		rf.persist()
+	}
+	rf.latestElectionTime = time.Now()
+	go func() {
+		rf.applyCh <- ApplyMsg{
+			SnapshotValid: true,
+			SnapshotIndex: args.LastIncludedIndex,
+			SnapshotTerm:  args.LastIncludedTerm,
+			Snapshot:      args.Data,
+		}
+	}()
+}
+
+func (rf *Raft) _sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
+}
+
+func (rf *Raft) sendInstallSnapshot(peerId int) {
+	rf.mu.Lock()
+	if rf.State != Leader {
+		rf.mu.Unlock()
+		return
+	}
+	args := &InstallSnapshotArgs{
+		Term:              rf.CurrentTerm,
+		LeaderId:          rf.me,
+		LastIncludedIndex: rf.log[0].Index,
+		LastIncludedTerm:  rf.log[0].Term,
+		Data:              rf.persister.ReadSnapshot(),
+	}
+	var reply *InstallSnapshotReply
+	rf.mu.Unlock()
+	ok := rf._sendInstallSnapshot(peerId, args, reply)
+	if ok != true {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if rf.CurrentTerm < reply.Term {
+		rf.becomeFollower(reply.Term)
+		rf.persist()
+		return
+	}
+	rf.nextIndex[peerId] = args.LastIncludedIndex + 1
+	return
+}
+
+func (rf *Raft) becomeFollower(term int) {
+	rf.CurrentTerm = term
+	rf.State = Follower
+	rf.VotedFor = -1
 }
 
 // example RequestVote RPC arguments structure.
@@ -219,10 +319,9 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	//If RPC request or response contains term T > currentTerm:
 	//set currentTerm = T, convert to follower
 	if rf.CurrentTerm < args.Term {
-		rf.CurrentTerm = args.Term
-		rf.State = Follower
-		rf.VotedFor = -1
+		rf.becomeFollower(args.Term)
 		rf.persist()
+
 	}
 	if rf.State != Follower {
 		return
@@ -352,9 +451,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	}
 	//rf.latestElectionTime = time.Now()
 	if rf.CurrentTerm < args.Term {
-		rf.CurrentTerm = args.Term
-		rf.State = Follower
-		rf.VotedFor = -1
+		rf.becomeFollower(args.Term)
 	}
 	rf.latestElectionTime = time.Now()
 	reply.Success = true
@@ -480,9 +577,7 @@ func (rf *Raft) sendAppendEntries(isHeartBeat bool, peerId int) {
 	defer rf.mu.Unlock()
 	if rf.CurrentTerm < reply.Term {
 		DPrintf("[%d],role=%d term=%d\t replyTerm=%d become follower", rf.me, rf.State, rf.CurrentTerm, reply.Term)
-		rf.State = Follower
-		rf.CurrentTerm = reply.Term
-		rf.VotedFor = -1
+		rf.becomeFollower(reply.Term)
 		rf.persist()
 		return
 	}
@@ -649,9 +744,7 @@ func (rf *Raft) _sendRequest(newTerm int, peerId int) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if rf.CurrentTerm < reply.Term {
-		rf.State = Follower
-		rf.CurrentTerm = reply.Term
-		rf.VotedFor = -1
+		rf.becomeFollower(reply.Term)
 		rf.persist()
 		return
 	}
@@ -722,9 +815,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.me = me
 
 	// Your initialization code here (2A, 2B, 2C).
-	rf.VotedFor = -1
-	rf.State = Follower
-	rf.CurrentTerm = 0
+	rf.becomeFollower(0)
 	rf.latestElectionTime = time.Now()
 	rf.heartBeatIntervalMS = time.Duration(50) * time.Millisecond
 	//0位占用空log
