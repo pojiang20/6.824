@@ -58,18 +58,23 @@ func (ck *Clerk) Get(key string) string {
 
 	leaderId := atomic.LoadInt64(&ck.leaderId)
 	value := ""
+	timeoutCnt := 0
 	for {
 		ok := ck._sendGet(leaderId, args, reply)
 		DPrintf("clientId[%d]\t Get reply=%s", ck.clientId, reply.Err)
-		if ok && reply.Err != ErrNotLeader {
-			if reply.Err == NoError {
-				value = reply.Value
-			}
+		if !ok || timeoutCnt > 3 {
 			break
 		}
-		DPrintf("clientId[%d]\t leaderid=%d change", ck.clientId, leaderId)
-		leaderId = (leaderId + 1) % int64(len(ck.servers))
-		time.Sleep(breakTimeMs)
+		if reply.Err == ErrNotLeader {
+			DPrintf("clientId[%d]\t leaderid=%d change", ck.clientId, leaderId)
+			leaderId = (leaderId + 1) % int64(len(ck.servers))
+			time.Sleep(breakTimeMs)
+		} else if reply.Err == ErrTimeout {
+			timeoutCnt++
+			time.Sleep(breakTimeMs)
+		} else {
+			break
+		}
 	}
 	ck.leaderId = leaderId
 	DPrintf("clientId[%d]\t get from leader=%d return %s", ck.clientId, leaderId, value)
@@ -101,16 +106,23 @@ func (ck *Clerk) PutAppend(key string, value string, op string) {
 		ClientId:  int(ck.clientId),
 	}
 	reply := &PutAppendReply{}
+	timeoutCnt := 0
 	for {
 		ok := ck._sendPutAppend(leaderId, args, reply)
 		DPrintf("clientId[%d]\t PutAppend reply=%s", ck.clientId, reply.Err)
-		if ok && reply.Err == ErrNotLeader {
+		if !ok || timeoutCnt > 3 {
+			break
+		}
+		if reply.Err == ErrNotLeader {
 			DPrintf("clientId[%d]\t leaderid=%d change", ck.clientId, leaderId)
 			leaderId = (leaderId + 1) % int64(len(ck.servers))
 			time.Sleep(breakTimeMs)
-			continue
+		} else if reply.Err == ErrTimeout {
+			timeoutCnt++
+			time.Sleep(breakTimeMs)
+		} else {
+			break
 		}
-		break
 	}
 	ck.leaderId = leaderId
 	DPrintf("clientId[%d]\t PutAppend to leader=%d", ck.clientId, leaderId)

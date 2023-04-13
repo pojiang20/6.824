@@ -20,3 +20,17 @@ if rf.latestElectionTime.Before(timeBeforeSleep) {
 }
 rf.mu.Unlock()
 ```
+
+```text
+start 2023-02-25 10:11:07
+Passing rate: 100/100
+Finish 2023-02-25 10:33:49
+
+```
+
+```text
+start 2023-02-25 12:46:03
+Passing rate: 100/100
+Finish 2023-02-25 13:43:24
+
+```

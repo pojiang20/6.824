@@ -1,4 +1,4 @@
-TestType=6
+TestType=4
 TestRound=10
 #1 background 2A
 if [ $TestType = 1 ]

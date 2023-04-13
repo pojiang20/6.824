@@ -47,17 +47,18 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
-	//内存存储数据
-	data map[string]string
 	//返回值
 	RetMsgMap map[int]chan RetMsg
 	//记录每一个客户端最后一个被应用的ID
 	lastApplied map[int]int
+	*StateMachine
 }
 
 type RetMsg struct {
-	val string
-	err Err
+	val       string
+	err       Err
+	clientId  int
+	requestId int
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -73,8 +74,8 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 		RequestId: args.RequestId,
 		ClientId:  args.ClientId,
 	}
-	reply.Value, reply.Err = kv.OpRun(op, args.RequestId)
-	DPrintf("KVServer.Get\t reply:[+%v]", reply)
+	reply.Value, reply.Err = kv.OpRun(op)
+	DPrintf("KVServer.Get\t reply:[%+v]", reply)
 }
 
 func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
@@ -91,49 +92,48 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 		RequestId: args.RequestId,
 		ClientId:  args.ClientId,
 	}
-	_, err := kv.OpRun(op, args.RequestId)
+	_, err := kv.OpRun(op)
 	reply.Err = err
 	DPrintf("KVServer.PutAppend\t reply:%s", reply.Err)
 }
 
-func (kv *KVServer) OpRun(op Op, RequestId int) (ret string, err Err) {
-	_, _, isLeader := kv.rf.Start(op)
+func (kv *KVServer) OpRun(op Op) (ret string, err Err) {
+	commandIndex, _, isLeader := kv.rf.Start(op)
 	if !isLeader {
 		return "", ErrNotLeader
 	}
-	retMsgCh := kv.getCh(RequestId)
+	retMsgCh := kv.getCh(commandIndex)
 
 	select {
 	case retMgs := <-retMsgCh:
-		kv.removeCh(RequestId)
+		if !kv.isSame(op, retMgs) {
+			return "", ErrNotLeader
+		}
 		return retMgs.val, retMgs.err
-	case <-time.After(600 * time.Millisecond):
+	case <-time.After(1000 * time.Millisecond):
+		//防止阻塞
+		go func() { <-retMsgCh }()
 		return "", ErrTimeout
 	}
 }
 
-func (kv *KVServer) getCh(RequestId int) (ret chan RetMsg) {
-	kv.mu.Lock()
-	if _, ok := kv.RetMsgMap[RequestId]; !ok {
-		retMsgCh := make(chan RetMsg, 1)
-		kv.RetMsgMap[RequestId] = retMsgCh
-	}
-	ret = kv.RetMsgMap[RequestId]
-	kv.mu.Unlock()
-	return
-}
-
-func (kv *KVServer) removeCh(RequestId int) {
-	kv.mu.Lock()
-	delete(kv.RetMsgMap, RequestId)
-	kv.mu.Unlock()
-}
-
-func (kv *KVServer) isRepeated(clientId int, msgId int) bool {
-	if val, ok := kv.lastApplied[clientId]; ok {
-		return msgId == val
+// 判断操作和返回值是否一致
+func (kv *KVServer) isSame(op Op, ret RetMsg) bool {
+	if op.ClientId == ret.clientId && op.RequestId == ret.requestId {
+		return true
 	}
 	return false
+}
+
+func (kv *KVServer) getCh(commandIndex int) (ret chan RetMsg) {
+	kv.mu.Lock()
+	if _, ok := kv.RetMsgMap[commandIndex]; !ok {
+		retMsgCh := make(chan RetMsg, 1)
+		kv.RetMsgMap[commandIndex] = retMsgCh
+	}
+	ret = kv.RetMsgMap[commandIndex]
+	kv.mu.Unlock()
+	return
 }
 
 func (kv *KVServer) Applier() {
@@ -144,16 +144,31 @@ func (kv *KVServer) Applier() {
 			if msg.CommandValid {
 				op := msg.Command.(Op)
 				DPrintf("kvId=%d,Applier get op: [%+v]", kv.me, op)
-				if retMsgCh, ok := kv.RetMsgMap[op.RequestId]; ok {
-					ret := kv.applyToStateMachine(op)
-					retMsgCh <- ret
+				if retMsgCh, ok := kv.RetMsgMap[msg.CommandIndex]; ok {
+					if op.OpType == GET {
+						ret := kv.applyToStateMachine(op)
+						retMsgCh <- ret
+					} else {
+						last, exist := kv.lastApplied[op.ClientId]
+						if !exist || last < op.RequestId {
+							kv.lastApplied[op.ClientId] = op.RequestId
+							ret := kv.applyToStateMachine(op)
+							retMsgCh <- ret
+						}
+					}
 				}
 			}
 		}
 	}
 }
 
-func (kv *KVServer) applyToStateMachine(op Op) (ret RetMsg) {
+type StateMachine struct {
+	//内存存储数据
+	data map[string]string
+}
+
+func (kv *StateMachine) applyToStateMachine(op Op) (ret RetMsg) {
+	ret.clientId, ret.requestId = op.ClientId, op.RequestId
 	switch op.OpType {
 	case GET:
 		key := op.Key
@@ -167,18 +182,39 @@ func (kv *KVServer) applyToStateMachine(op Op) (ret RetMsg) {
 		kv.data[k] = v
 		ret = RetMsg{err: NoError}
 	case APPEND:
-		key, v := op.Key, op.Val
-		if val, ok := kv.data[key]; ok {
-			kv.data[key] = val + v
-			ret = RetMsg{err: NoError}
-		} else {
-			ret = RetMsg{err: ErrKeyNotExist}
-		}
+		val := kv.data[op.Key]
+		kv.data[op.Key] = val + op.Val
+		ret = RetMsg{err: NoError}
 	default:
 		//不支持
 		ret = RetMsg{err: ErrNotSupport}
 	}
-	DPrintf("【op】%+v【ret】%+v", op, ret)
+	DPrintf("applyToStateMachine:【op】%+v【ret】%+v", op, ret)
+	return
+}
+
+func (kv *StateMachine) applyToStateMachine1(op Op) (ret RetMsg) {
+	switch op.OpType {
+	case GET:
+		key := op.Key
+		if val, ok := kv.data[key]; ok {
+			ret = RetMsg{val: val, err: NoError}
+		} else {
+			ret = RetMsg{val: "", err: ErrKeyNotExist}
+		}
+	case PUT:
+		k, v := op.Key, op.Val
+		kv.data[k] = v
+		ret = RetMsg{err: NoError}
+	case APPEND:
+		val := kv.data[op.Key]
+		kv.data[op.Key] = val + op.Val
+		ret = RetMsg{err: NoError}
+	default:
+		//不支持
+		ret = RetMsg{err: ErrNotSupport}
+	}
+	DPrintf("applyToStateMachine:【op】%+v【ret】%+v", op, ret)
 	return
 }
 
@@ -228,9 +264,12 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	// You may need initialization code here.
-	kv.data = make(map[string]string)
 	kv.RetMsgMap = make(map[int]chan RetMsg)
 	kv.lastApplied = make(map[int]int)
+
+	kv.StateMachine = &StateMachine{
+		data: make(map[string]string),
+	}
 
 	go kv.Applier()
 
